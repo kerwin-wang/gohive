@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
@@ -1086,9 +1087,11 @@ func (c *Cursor) Description() [][]string {
 		for _, typeDesc := range column.TypeDesc.Types {
 			var precision string
 			var scale string
+			var marshal []byte
 			if typeDesc.PrimitiveEntry != nil &&
 				typeDesc.PrimitiveEntry.TypeQualifiers != nil &&
 				typeDesc.PrimitiveEntry.TypeQualifiers.GetQualifiers() != nil {
+				marshal, _ = json.Marshal(typeDesc.PrimitiveEntry.TypeQualifiers.GetQualifiers())
 				if pre, ok := typeDesc.PrimitiveEntry.TypeQualifiers.GetQualifiers()["precision"]; ok {
 					precision = string(*pre.I32Value)
 				}
@@ -1097,7 +1100,7 @@ func (c *Cursor) Description() [][]string {
 				}
 			}
 
-			m[i] = []string{column.ColumnName, typeDesc.PrimitiveEntry.Type.String(), precision, scale}
+			m[i] = []string{column.ColumnName, typeDesc.PrimitiveEntry.Type.String(), precision, scale, fmt.Sprintf("%s", marshal)}
 		}
 	}
 	c.description = m
