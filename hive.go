@@ -1084,7 +1084,15 @@ func (c *Cursor) Description() [][]string {
 	m := make([][]string, len(metaResponse.Schema.Columns))
 	for i, column := range metaResponse.Schema.Columns {
 		for _, typeDesc := range column.TypeDesc.Types {
-			m[i] = []string{column.ColumnName, typeDesc.PrimitiveEntry.Type.String(), typeDesc.PrimitiveEntry.TypeQualifiers.String()}
+			var precision string
+			var scale string
+			if pre, ok := typeDesc.PrimitiveEntry.TypeQualifiers.GetQualifiers()["precision"]; ok {
+				precision = string(*pre.I32Value)
+			}
+			if sc, ok := typeDesc.PrimitiveEntry.TypeQualifiers.GetQualifiers()["scale"]; ok {
+				scale = string(*sc.I32Value)
+			}
+			m[i] = []string{column.ColumnName, typeDesc.PrimitiveEntry.Type.String(), precision, scale}
 		}
 	}
 	c.description = m
