@@ -1086,12 +1086,17 @@ func (c *Cursor) Description() [][]string {
 		for _, typeDesc := range column.TypeDesc.Types {
 			var precision string
 			var scale string
-			if pre, ok := typeDesc.PrimitiveEntry.TypeQualifiers.GetQualifiers()["precision"]; ok {
-				precision = string(*pre.I32Value)
+			if typeDesc.PrimitiveEntry != nil &&
+				typeDesc.PrimitiveEntry.TypeQualifiers != nil &&
+				typeDesc.PrimitiveEntry.TypeQualifiers.GetQualifiers() != nil {
+				if pre, ok := typeDesc.PrimitiveEntry.TypeQualifiers.GetQualifiers()["precision"]; ok {
+					precision = string(*pre.I32Value)
+				}
+				if sc, ok := typeDesc.PrimitiveEntry.TypeQualifiers.GetQualifiers()["scale"]; ok {
+					scale = string(*sc.I32Value)
+				}
 			}
-			if sc, ok := typeDesc.PrimitiveEntry.TypeQualifiers.GetQualifiers()["scale"]; ok {
-				scale = string(*sc.I32Value)
-			}
+
 			m[i] = []string{column.ColumnName, typeDesc.PrimitiveEntry.Type.String(), precision, scale}
 		}
 	}
