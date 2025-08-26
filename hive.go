@@ -1084,7 +1084,7 @@ func (c *Cursor) Description() [][]string {
 	m := make([][]string, len(metaResponse.Schema.Columns))
 	for i, column := range metaResponse.Schema.Columns {
 		for _, typeDesc := range column.TypeDesc.Types {
-			m[i] = []string{column.ColumnName, typeDesc.PrimitiveEntry.Type.String()}
+			m[i] = []string{column.ColumnName, typeDesc.PrimitiveEntry.Type.String(), typeDesc.PrimitiveEntry.TypeQualifiers.String()}
 		}
 	}
 	c.description = m
