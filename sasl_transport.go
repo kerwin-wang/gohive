@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/apache/thrift/lib/go/thrift"
 	"github.com/beltran/gosasl"
@@ -35,6 +36,12 @@ type TSaslTransport struct {
 	maxLength      uint32
 	principal      string
 	OpeningContext context.Context
+
+	// closeOnce/closeErr 保证 Close 幂等: Open 失败时会内部自调 Close 做清理,
+	// 上层(如 gohive.innerConnect)拿到错误后往往还会再调一次 Close 兜底,
+	// 没有幂等保护会导致 saslClient.Dispose 被重复调用, 在部分 native 实现下不安全。
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // NewTSaslTransport return a TSaslTransport
@@ -71,6 +78,20 @@ func (p *TSaslTransport) IsOpen() bool {
 
 // Open check if a SASL transport connection is opened
 func (p *TSaslTransport) Open() (err error) {
+	// 关键修复: Open 中途任何一步失败(tp.Open/SASL 握手各阶段)都不能直接 return,
+	// 否则已打开的底层 socket、已创建的 saslClient(可能已持有 GSSAPI native
+	// context/凭据)会半开泄漏, 上层拿到的只是 nil,err, 无法再补救释放。
+	// 这里通过 defer 保证: 只要 Open 最终失败, 一定会调用 Close 做统一清理;
+	// Close 本身是幂等的(见下), 不会因外层再调一次 Close 而重复释放。
+	defer func() {
+		if err == nil {
+			return
+		}
+		if closeErr := p.Close(); closeErr != nil {
+			err = errors.Wrapf(err, "close after open failure also failed: %v", closeErr)
+		}
+	}()
+
 	if !p.tp.IsOpen() {
 		err = p.tp.Open()
 		if err != nil {
@@ -97,7 +118,11 @@ func (p *TSaslTransport) Open() (err error) {
 			if err != nil {
 				return
 			}
-			p.sendSaslMsg(p.OpeningContext, OK, proccessed)
+			// 原实现忽略了这里的错误返回值: 若发送在握手中途失败(如连接被对端重置),
+			// 会被当作握手仍在正常进行, 导致后续 recvSaslMsg 在已损坏的连接上继续阻塞/读错数据。
+			if err = p.sendSaslMsg(p.OpeningContext, OK, proccessed); err != nil {
+				return err
+			}
 		} else if status == COMPLETE {
 			if !p.saslClient.Complete() {
 				return thrift.NewTTransportException(thrift.NOT_OPEN, "The server erroneously indicated that SASL negotiation was complete")
@@ -111,9 +136,19 @@ func (p *TSaslTransport) Open() (err error) {
 }
 
 // Close close a SASL transport connection
-func (p *TSaslTransport) Close() (err error) {
-	p.saslClient.Dispose()
-	return p.tp.Close()
+//
+// 幂等: 使用 sync.Once 保护, 避免 Open 失败自清理 + 上层兜底再调一次 Close
+// 导致 saslClient.Dispose()/底层 GSSAPI 释放被执行两次。
+func (p *TSaslTransport) Close() error {
+	p.closeOnce.Do(func() {
+		if p.saslClient != nil {
+			p.saslClient.Dispose()
+		}
+		if p.tp != nil {
+			p.closeErr = p.tp.Close()
+		}
+	})
+	return p.closeErr
 }
 
 func (p *TSaslTransport) sendSaslMsg(ctx context.Context, status uint8, body []byte) error {

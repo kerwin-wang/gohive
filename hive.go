@@ -192,8 +192,44 @@ func dial(ctx context.Context, addr string, dialFn DialContextFunc, timeout time
 
 func innerConnect(ctx context.Context, host string, port int, auth string,
 	configuration *ConnectConfiguration) (conn *Connection, err error) {
+	// 归一化配置必须在使用 configuration 的任何字段(如 DialContext)之前完成,
+	// 否则 configuration 为 nil 时会直接 panic。
+	if configuration == nil {
+		configuration = NewConnectConfiguration()
+	}
 
 	var socket thrift.TTransport
+	var transport thrift.TTransport
+	var connection *Connection
+	success := false
+
+	// 统一失败清理: 必须在任何 socket/transport 创建之前安装。只要函数没有走到
+	// success=true 就返回, 说明中途失败, 由这里统一回收已创建的资源, 避免
+	// socket/transport(以及其内部持有的 GSSAPI/SASL client) 半开泄漏。
+	// 优先关闭粒度最大的对象: connection(会先关闭 server 端 session 再关闭 transport) >
+	// transport(TSaslTransport.Close 会同时 Dispose SASL/GSSAPI client) > 裸 socket。
+	defer func() {
+		if success {
+			return
+		}
+		var cleanupErr error
+		switch {
+		case connection != nil:
+			cleanupErr = connection.Close()
+		case transport != nil:
+			cleanupErr = transport.Close()
+		case socket != nil:
+			cleanupErr = socket.Close()
+		}
+		if cleanupErr != nil {
+			if err == nil {
+				err = cleanupErr
+			} else {
+				err = errors.Wrapf(err, "cleanup after connect failure also failed: %v", cleanupErr)
+			}
+		}
+	}()
+
 	addr := fmt.Sprintf("%s:%d", host, port)
 	if configuration.DialContext != nil {
 		var netConn net.Conn
@@ -231,11 +267,6 @@ func innerConnect(ctx context.Context, host string, port int, auth string,
 		}
 	}
 
-	var transport thrift.TTransport
-
-	if configuration == nil {
-		configuration = NewConnectConfiguration()
-	}
 	if configuration.Username == "" {
 		_user, err := user.Current()
 		if err != nil {
@@ -271,6 +302,10 @@ func innerConnect(ctx context.Context, host string, port int, auth string,
 				return nil, err
 			}
 			saslClient := gosasl.NewSaslClient(host, mechanism)
+			// HTTP 模式下 saslClient 只用于生成一次性 token, 不属于最终的 transport,
+			// 因此 transport 的 Close 不会释放它; 无论后续成功/失败都必须在这里
+			// 无条件释放, 否则底层 GSSAPI context/凭据(native 资源)会残留。
+			defer saslClient.Dispose()
 			token, err := saslClient.Start()
 			if err != nil {
 				return nil, err
@@ -356,7 +391,10 @@ func innerConnect(ctx context.Context, host string, port int, auth string,
 	if database == "" {
 		database = "default"
 	}
-	connection := &Connection{
+	// 注意: 这里必须用 "=" 赋值给外层已声明的 connection 变量(而非 ":=" 重新声明),
+	// 否则会遮蔽函数顶部用于失败清理 defer 的 connection, 导致 USE database 失败时
+	// 清理逻辑找不到已创建的连接, 无法关闭 transport/session。
+	connection = &Connection{
 		host:                host,
 		port:                port,
 		database:            database,
@@ -373,10 +411,11 @@ func innerConnect(ctx context.Context, host string, port int, auth string,
 		defer cursor.Close()
 		cursor.Exec(context.Background(), "USE "+configuration.Database)
 		if cursor.Err != nil {
-			return nil, cursor.Err
+			return nil, cursor.Err // 已创建的 connection 会由上面的失败清理 defer 关闭
 		}
 	}
 
+	success = true
 	return connection, nil
 }
 
