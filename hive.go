@@ -469,16 +469,17 @@ const _ASYNC_ENDED = 5
 
 // Cursor is used for fetching the rows after a query
 type Cursor struct {
-	conn            *Connection
-	operationHandle *hiveserver.TOperationHandle
-	queue           []*hiveserver.TColumn
-	response        *hiveserver.TFetchResultsResp
-	columnIndex     int
-	totalRows       int
-	state           int
-	newData         bool
-	Err             error
-	description     [][]string
+	conn              *Connection
+	operationHandle   *hiveserver.TOperationHandle
+	queue             []*hiveserver.TColumn
+	response          *hiveserver.TFetchResultsResp
+	columnIndex       int
+	totalRows         int
+	state             int
+	newData           bool
+	Err               error
+	description       [][]string
+	descriptionDetail []ColumnTypeInfo
 
 	// Caller is responsible for managing this channel
 	Logs chan<- []string
@@ -1059,6 +1060,14 @@ func isNull(nulls []byte, position int) bool {
 	return false
 }
 
+// ColumnTypeInfo 描述结果集一列的元信息，相比 Description() 额外携带 DECIMAL 的 precision/scale。
+type ColumnTypeInfo struct {
+	Name      string // 列名
+	Type      string // 类型枚举名，如 "DECIMAL_TYPE"
+	Precision int32  // DECIMAL 精度，非 DECIMAL 列为 0
+	Scale     int32  // DECIMAL 小数位，非 DECIMAL 列为 0
+}
+
 // Description return a map with the names of the columns and their types
 // must be called after a FetchResult request
 // a context should be added here but seems to be ignored by thrift
@@ -1066,8 +1075,58 @@ func (c *Cursor) Description() [][]string {
 	if c.description != nil {
 		return c.description
 	}
+	columns := c.fetchResultSetColumns()
+	if columns == nil {
+		return nil
+	}
+	m := make([][]string, len(columns))
+	for i, column := range columns {
+		for _, typeDesc := range column.TypeDesc.Types {
+			m[i] = []string{column.ColumnName, typeDesc.PrimitiveEntry.Type.String()}
+		}
+	}
+	c.description = m
+	return m
+}
+
+// DescriptionDetail 返回结果集各列的完整元信息，含 DECIMAL 列的 precision/scale。
+// 与 Description() 共享同一份底层列元数据；非 DECIMAL 列的 Precision/Scale 为 0。
+func (c *Cursor) DescriptionDetail() []ColumnTypeInfo {
+	if c.descriptionDetail != nil {
+		return c.descriptionDetail
+	}
+	columns := c.fetchResultSetColumns()
+	if columns == nil {
+		return nil
+	}
+	infos := make([]ColumnTypeInfo, 0, len(columns))
+	for _, column := range columns {
+		info := ColumnTypeInfo{Name: column.ColumnName}
+		for _, typeDesc := range column.TypeDesc.Types {
+			if typeDesc.PrimitiveEntry == nil {
+				continue
+			}
+			info.Type = typeDesc.PrimitiveEntry.Type.String()
+			if qualifiers := typeDesc.PrimitiveEntry.TypeQualifiers; qualifiers != nil {
+				if v, ok := qualifiers.Qualifiers[hiveserver.PRECISION]; ok && v != nil && v.I32Value != nil {
+					info.Precision = *v.I32Value
+				}
+				if v, ok := qualifiers.Qualifiers[hiveserver.SCALE]; ok && v != nil && v.I32Value != nil {
+					info.Scale = *v.I32Value
+				}
+			}
+		}
+		infos = append(infos, info)
+	}
+	c.descriptionDetail = infos
+	return infos
+}
+
+// fetchResultSetColumns 获取结果集的列描述，出错时设置 c.Err 并返回 nil。
+func (c *Cursor) fetchResultSetColumns() []*hiveserver.TColumnDesc {
 	if c.operationHandle == nil {
 		c.Err = errors.Errorf("Description can only be called after after a Poll or after an async request")
+		return nil
 	}
 
 	metaRequest := hiveserver.NewTGetResultSetMetadataReq()
@@ -1081,14 +1140,7 @@ func (c *Cursor) Description() [][]string {
 		c.Err = errors.New(safeStatus(metaResponse.GetStatus()).String())
 		return nil
 	}
-	m := make([][]string, len(metaResponse.Schema.Columns))
-	for i, column := range metaResponse.Schema.Columns {
-		for _, typeDesc := range column.TypeDesc.Types {
-			m[i] = []string{column.ColumnName, typeDesc.PrimitiveEntry.Type.String()}
-		}
-	}
-	c.description = m
-	return m
+	return metaResponse.Schema.Columns
 }
 
 // HasMore returns whether more rows can be fetched from the server
